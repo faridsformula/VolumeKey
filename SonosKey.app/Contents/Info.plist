@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>SonosKey</string>
+    <key>CFBundleDisplayName</key>
+    <string>SonosKey</string>
+    <key>CFBundleExecutable</key>
+    <string>SonosKey</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.faridsformula.sonoskey2</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>LSUIElement</key>
+    <false/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>SonosKey needs local network access to discover and control your Sonos speakers and LG TVs.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_sonos._tcp</string>
+    </array>
+</dict>
+</plist>
