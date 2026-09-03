@@ -14,6 +14,7 @@ if [ ! -f AppIcon.icns ]; then
     iconutil -c icns AppIcon.iconset -o AppIcon.icns
 fi
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp knob.png "$APP/Contents/Resources/knob.png"
 
 echo "Compiling…"
 swiftc -O \
@@ -21,17 +22,16 @@ swiftc -O \
     Sources/*.swift \
     -o "$APP/Contents/MacOS/VolumeKey"
 
-# Apple Development cert SHA1 — stable identity so TCC permissions (Local Network, Accessibility)
-# persist across rebuilds. Falls back to ad-hoc if the cert isn't available.
+# Prefer a named Apple Development identity so TCC (Accessibility, Local Network)
+# can persist across rebuilds. SHA1 hash is a fallback; ad-hoc is last resort.
 SIGN_ID="CF603165B17B0380F8BD424BCC1CF7E25473E1E6"
-codesign --force --deep --sign "$SIGN_ID" "$APP" \
+codesign --force --deep --sign "Apple Development" "$APP" 2>/dev/null \
+    || codesign --force --deep --sign "$SIGN_ID" "$APP" 2>/dev/null \
     || codesign --force --deep --sign - "$APP"
 
 echo "Built $APP"
 
-# Automatically refresh Local Network permission for the new binary cdhash.
-# (macOS silently invalidates Local Network on every binary change even when the
-# UI shows it allowed; this drives System Settings to toggle off+on which rebinds.)
-if [ "$1" != "--no-refresh" ]; then
-    "$(dirname "$0")/refresh-permission.sh"
-fi
+# Permission repair is intentionally manual. Automated privacy-pane deep links,
+# TCC resets, and GUI scripting can wedge System Settings, especially when an
+# ad-hoc rebuild changes the app's code identity. Building never opens or drives
+# System Settings.

@@ -47,10 +47,40 @@ cd VolumeKey
 
 Requires Xcode command-line tools. The build is a single `swiftc` invocation — no package manager, no dependencies.
 
+### Native HDMI-CEC probe
+
+Newer Apple-silicon Macs contain a native HDMI-CEC stack, but Apple does not
+publish its CEC API. To inspect a Mac without controlling any connected device,
+run:
+
+```bash
+./Tools/hdmi-cec-probe.sh
+```
+
+The standalone probe reports live IOKit CEC services, existing Apple CEC
+clients, HDMI port controllers, and the availability of the private CEC API.
+It deliberately does **not** transmit CEC frames, open a receive queue, or claim
+a CEC logical address. The private API check only loads the system framework and
+looks up symbol names.
+
+To explicitly attempt one volume-up action to an HDMI audio receiver (CEC
+logical address 5), run:
+
+```bash
+./Tools/hdmi-cec-probe.sh --volume-up
+```
+
+This sends one `User Control Pressed: Volume Up` frame followed by its required
+`User Control Released` frame. Because Apple's `corercd` daemon normally owns
+the CEC interface exclusively, the script asks for administrator access to
+terminate it once. Launchd automatically restarts the daemon while the sender
+briefly retries for the interface. The daemon is never unloaded or disabled.
+This uses Apple's private CEC stack and may stop working after a macOS update.
+
 ## Troubleshooting
 
 - The app logs to `/tmp/volumekey.log` — check there first.
-- **Devices stop being discovered after you rebuild from source:** macOS silently invalidates the Local Network permission whenever an app's binary changes. Toggle VolumeKey off and on in System Settings → Privacy & Security → Local Network (or run `./refresh-permission.sh`).
+- **Permissions stop working after you rebuild from source:** an ad-hoc rebuild can invalidate the app's prior privacy identity. Enable VolumeKey manually in the relevant Privacy & Security pane, then relaunch it. VolumeKey checks Accessibility once at launch and never opens, drives, or repeatedly contacts System Settings.
 - **Samsung TVs:** need "network standby" / IP control enabled (usually on by default on recent models).
 - **Roku:** requires "Control by mobile apps" (Settings → System → Advanced system settings), on by default.
 - **DDC monitors:** Apple Silicon Macs only; the display must be connected directly (some hubs/KVMs block DDC).

@@ -18,8 +18,8 @@ final class DLNARenderer: VolumeTarget {
     private(set) var cachedVolume: Int?
     private var cachedMuted = false
 
-    private let port: UInt16
-    private let controlPath: String
+    let port: UInt16
+    let controlPath: String
 
     init(uuid: String, name: String, ip: String, port: UInt16, controlPath: String, initialVolume: Int?) {
         self.uuid = uuid
@@ -56,6 +56,25 @@ final class DLNARenderer: VolumeTarget {
     }
 
     func toggleMute(completion: @escaping (Int?, Bool) -> Void) {
+        // Onkyo's UPnP SetMute can map to minimum volume on some AVRs. Use the
+        // receiver's native eISCP AMT command for real AVR muting, while keeping
+        // DLNA as a fallback when Network Control/eISCP is unavailable.
+        if name.localizedCaseInsensitiveContains("onkyo") {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                if let muted = OnkyoISCP.toggleMute(host: self.ip) {
+                    self.cachedMuted = muted
+                    DispatchQueue.main.async { completion(self.cachedVolume, muted) }
+                } else {
+                    self.toggleMuteViaDLNA(completion: completion)
+                }
+            }
+            return
+        }
+        toggleMuteViaDLNA(completion: completion)
+    }
+
+    private func toggleMuteViaDLNA(completion: @escaping (Int?, Bool) -> Void) {
         soap(action: "GetMute", extraArgs: "") { [weak self] xml in
             guard let self = self else { return }
             let current = xml.flatMap { Self.tagValue($0, "CurrentMute") } == "1"

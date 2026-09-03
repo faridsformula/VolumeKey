@@ -21,7 +21,7 @@
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>LSUIElement</key>
-    <false/>
+    <true/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>VolumeKey needs local network access to discover and control your Sonos speakers and LG TVs.</string>
     <key>NSBonjourServices</key>
