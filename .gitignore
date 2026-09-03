@@ -4,3 +4,4 @@ AppIcon.iconset/
 AppIcon.icns
 .DS_Store
 *.dmg
+.aider*

@@ -1,4 +1,5 @@
 import Cocoa
+import CoreText
 import Network
 import Carbon.HIToolbox
 import Darwin
@@ -185,13 +186,17 @@ final class SonosDiscovery {
         var sonosIPs = [String]()
         let lock = NSLock()
         let group = DispatchGroup()
-        let scanQueue = DispatchQueue(label: "sonos.scan", attributes: .concurrent)
+        let scanQueue = DispatchQueue(label: "sonos.scan", qos: .utility, attributes: .concurrent)
+        // Cap in-flight probes so launch does not open 254 sockets at once and
+        // starve the first volume-key commands on the same network.
+        let gate = DispatchSemaphore(value: 24)
         for prefix in prefixes {
             for i in 1...254 {
                 let ip = "\(prefix).\(i)"
                 group.enter()
                 scanQueue.async {
-                    defer { group.leave() }
+                    gate.wait()
+                    defer { gate.signal(); group.leave() }
                     if let resp = RawHTTP.request(host: ip, port: 1400, method: "GET",
                                                   path: "/xml/device_description.xml",
                                                   timeoutSec: 1),
@@ -482,8 +487,15 @@ final class KeyHijacker {
 
     private var tap: CFMachPort?
     private var runLoopSrc: CFRunLoopSource?
+    private var attemptedStart = false
+    var isActive: Bool { tap != nil }
 
     func start() {
+        // Idempotent, and deliberately one-shot. Repeated failed event-tap
+        // creation can churn Accessibility/TCC and wedge System Settings after
+        // an ad-hoc rebuild invalidates the app's prior permission record.
+        guard !attemptedStart, tap == nil else { return }
+        attemptedStart = true
         let mask = CGEventMask(1 << 14) // NSSystemDefined / kCGEventSystemDefined
         let callback: CGEventTapCallBack = { _, type, event, refcon in
             guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
@@ -497,8 +509,7 @@ final class KeyHijacker {
                                            eventsOfInterest: mask,
                                            callback: callback,
                                            userInfo: ref) else {
-            NSLog("VolumeKey: tap creation failed (need Accessibility permission) — retrying in 3s")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.start() }
+            NSLog("VolumeKey: key tap unavailable; enable Accessibility and relaunch")
             return
         }
         NSLog("VolumeKey: key tap active")
@@ -550,46 +561,256 @@ final class KeyHijacker {
 
 // MARK: - Volume HUD
 
+final class AmpKnobView: NSView {
+    /// Backend volume for Amp mode. The artwork starts 32° clockwise,
+    /// then sweeps 330° clockwise as volume moves 0...100.
+    var volume: CGFloat = 0 { didSet { updateDialLayer() } }
+    var muted = false { didSet { updateDialLayer() } }
+
+    override var isOpaque: Bool { false }
+    private let dialLayer = CALayer()
+
+    private static let knobImage: NSImage? = {
+        if let url = Bundle.main.url(forResource: "knob", withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
+
+        // Keep direct-from-source debug builds useful; packaged builds use the
+        // bundled resource above.
+        let sourceURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("knob.png")
+        return NSImage(contentsOf: sourceURL)
+    }()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureDialLayer()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureDialLayer()
+    }
+
+    private func configureDialLayer() {
+        wantsLayer = true
+        guard let image = Self.knobImage,
+              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        dialLayer.contents = cgImage
+        dialLayer.contentsGravity = .resize
+        dialLayer.minificationFilter = .trilinear
+        dialLayer.magnificationFilter = .linear
+        dialLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer?.addSublayer(dialLayer)
+        needsLayout = true
+        updateDialLayer()
+    }
+
+    override func layout() {
+        super.layout()
+        guard let image = Self.knobImage else { return }
+        let imageHeight = min(bounds.width, bounds.height) - 2
+        let imageWidth = imageHeight * image.size.width / image.size.height
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dialLayer.bounds = CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight)
+        dialLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        dialLayer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        CATransaction.commit()
+    }
+
+    private func updateDialLayer() {
+        let clampedVolume = min(100, max(0, volume))
+        let degrees: CGFloat = -32 - clampedVolume / 100 * 330
+        let radians = degrees * .pi / 180
+
+        // The spring supplies the intermediate angles; disabling implicit
+        // actions avoids stacking a second animation for every volume event.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dialLayer.setAffineTransform(CGAffineTransform(rotationAngle: radians))
+        dialLayer.opacity = muted ? 0.4 : 1
+        CATransaction.commit()
+    }
+}
+
+final class AmpIndicatorView: NSView {
+    override var isOpaque: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let triangle = NSBezierPath()
+        triangle.move(to: NSPoint(x: bounds.midX, y: bounds.maxY))
+        triangle.line(to: NSPoint(x: bounds.minX, y: bounds.minY))
+        triangle.line(to: NSPoint(x: bounds.maxX, y: bounds.minY))
+        triangle.close()
+        NSColor(white: 70.0 / 255.0, alpha: 1).setFill() // Dominant dial color: #464646.
+        triangle.fill()
+        triangle.lineWidth = 1
+        NSColor.white.setStroke()
+        triangle.stroke()
+    }
+}
+
 final class VolumeHUD {
     private var window: NSWindow?
+    private var track: NSView?
     private var bar: NSView?
+    private var ampKnob: AmpKnobView?
+    private var ampIndicator: AmpIndicatorView?
     private var label: NSTextField?
     private var hideTimer: Timer?
+    private var motionTimer: Timer?
+    private var displayedVolume: CGFloat?
+    private var targetVolume: CGFloat = 0
+    private var volumeVelocity: CGFloat = 0
+    private var lastMotionTime = ProcessInfo.processInfo.systemUptime
+    private var currentDeviceLabel = "Sonos"
+    private var currentMuted = false
+    private var currentAmpMode = false
 
-    func show(volume: Int, muted: Bool = false, label deviceLabel: String = "Sonos") {
+    func show(volume: Int, muted: Bool = false, label deviceLabel: String = "Sonos",
+              ampScale: Bool = false) {
         if window == nil { build() }
-        guard let w = window, let v = w.contentView, let bar = bar, let label = label else { return }
+        let modeChanged = currentAmpMode != ampScale
+        currentAmpMode = ampScale
+        configureLayout(ampMode: ampScale)
+        guard let w = window, let bar = bar, let label = label else { return }
         let pct = max(0, min(100, volume))
-        let width = (v.bounds.width - 40) * CGFloat(pct) / 100.0
-        bar.isHidden = false
-        bar.frame = NSRect(x: 20, y: 20, width: width, height: 8)
+        let displayTarget = CGFloat(pct)
+        track?.isHidden = ampScale
+        bar.isHidden = ampScale
+        ampKnob?.isHidden = !ampScale
+        ampIndicator?.isHidden = !ampScale
+        label.isHidden = ampScale
         bar.layer?.backgroundColor = muted ? NSColor.systemRed.cgColor : NSColor.white.cgColor
-        label.frame = NSRect(x: 20, y: 40, width: 220, height: 24)
         label.font = .systemFont(ofSize: 14, weight: .medium)
         label.maximumNumberOfLines = 1
-        label.stringValue = muted ? "\(deviceLabel)  Muted" : "\(deviceLabel)  \(volume)"
+        label.lineBreakMode = .byClipping
+
+        currentDeviceLabel = deviceLabel
+        currentMuted = muted
+        targetVolume = displayTarget
+        // A newly appearing HUD should start at the actual level. While visible,
+        // every update only retargets the same spring—animations never queue.
+        if modeChanged || displayedVolume == nil || !w.isVisible || w.alphaValue == 0 {
+            displayedVolume = targetVolume
+            volumeVelocity = 0
+            renderVolumeFrame()
+        } else {
+            startVolumeMotion()
+        }
+        if !ampScale { pulseTextGlow(muted: muted) }
+        w.alphaValue = 1
         w.orderFrontRegardless()
         hideTimer?.invalidate()
         hideTimer = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: false) { [weak self] _ in
-            self?.window?.orderOut(nil)
+            self?.fadeOut()
         }
     }
 
     // Text-only variant for status messages (pairing prompts, unreachable TV).
     func showMessage(_ text: String) {
         if window == nil { build() }
+        currentAmpMode = false
+        configureLayout(ampMode: false)
         guard let w = window, let bar = bar, let label = label else { return }
+        motionTimer?.invalidate()
+        motionTimer = nil
+        label.isHidden = false
+        track?.isHidden = true
         bar.isHidden = true
+        ampKnob?.isHidden = true
+        ampIndicator?.isHidden = true
         label.frame = NSRect(x: 20, y: 12, width: 220, height: 56)
         label.font = .systemFont(ofSize: 12, weight: .medium)
         label.maximumNumberOfLines = 3
         label.lineBreakMode = .byWordWrapping
         label.stringValue = text
+        pulseTextGlow(muted: false)
+        w.alphaValue = 1
         w.orderFrontRegardless()
         hideTimer?.invalidate()
         hideTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
-            self?.window?.orderOut(nil)
+            self?.fadeOut()
         }
+    }
+
+    private func startVolumeMotion() {
+        guard motionTimer == nil else { return }
+        lastMotionTime = ProcessInfo.processInfo.systemUptime
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.stepVolumeMotion()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        motionTimer = timer
+    }
+
+    private func stepVolumeMotion() {
+        guard var value = displayedVolume else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = CGFloat(min(1.0 / 30.0, max(0.001, now - lastMotionTime)))
+        lastMotionTime = now
+
+        // Critically damped spring: continuously follows rapid encoder updates
+        // without the staircase or animation backlog of per-key transitions.
+        let stiffness: CGFloat = 120
+        let damping: CGFloat = 22
+        let acceleration = (targetVolume - value) * stiffness - volumeVelocity * damping
+        volumeVelocity += acceleration * dt
+        value += volumeVelocity * dt
+        displayedVolume = min(100, max(0, value))
+        renderVolumeFrame()
+
+        if abs(targetVolume - value) < 0.02, abs(volumeVelocity) < 0.05 {
+            displayedVolume = targetVolume
+            volumeVelocity = 0
+            renderVolumeFrame()
+            motionTimer?.invalidate()
+            motionTimer = nil
+        }
+    }
+
+    private func renderVolumeFrame() {
+        guard let content = window?.contentView, let bar = bar, let label = label,
+              let value = displayedVolume else { return }
+        if currentAmpMode {
+            ampKnob?.volume = value
+            ampKnob?.muted = currentMuted
+            return
+        }
+        let width = (content.bounds.width - 40) * value / 100.0
+        bar.frame = NSRect(x: 20, y: 20, width: width, height: 8)
+        let number = Int(value.rounded())
+        let text = currentMuted ? "\(currentDeviceLabel)  Muted" : "\(currentDeviceLabel)  \(number)"
+        if label.stringValue != text { label.stringValue = text }
+    }
+
+    private func pulseTextGlow(muted: Bool) {
+        guard let layer = label?.layer else { return }
+        layer.shadowColor = (muted ? NSColor.systemRed : NSColor.systemCyan).cgColor
+        layer.shadowOffset = .zero
+        layer.shadowRadius = 8
+        layer.shadowOpacity = 0.16
+
+        let glow = CABasicAnimation(keyPath: "shadowOpacity")
+        glow.fromValue = 0.85
+        glow.toValue = 0.16
+        glow.duration = 0.55
+        glow.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(glow, forKey: "textAfterglow")
+    }
+
+    private func fadeOut() {
+        guard let w = window else { return }
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.24
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            w.animator().alphaValue = 0
+        }, completionHandler: {
+            w.orderOut(nil)
+        })
     }
 
     private func build() {
@@ -615,6 +836,7 @@ final class VolumeHUD {
         track.layer?.backgroundColor = NSColor(white: 1, alpha: 0.18).cgColor
         track.layer?.cornerRadius = 4
         content.addSubview(track)
+        self.track = track
 
         let barView = NSView(frame: NSRect(x: 20, y: 20, width: 0, height: 8))
         barView.wantsLayer = true
@@ -629,11 +851,52 @@ final class VolumeHUD {
         labelView.font = .systemFont(ofSize: 14, weight: .medium)
         labelView.backgroundColor = .clear
         labelView.isBordered = false
+        labelView.wantsLayer = true
         content.addSubview(labelView)
         self.label = labelView
 
+        let knob = AmpKnobView(frame: NSRect(x: 0, y: 0, width: 210, height: 210))
+        knob.isHidden = true
+        content.addSubview(knob, positioned: .below, relativeTo: labelView)
+        self.ampKnob = knob
+
+        let indicatorHeight: CGFloat = 30
+        let indicatorWidth = 2 * indicatorHeight / sqrt(3)
+        let indicator = AmpIndicatorView(frame: NSRect(
+            x: (210 - indicatorWidth) / 2,
+            y: 0,
+            width: indicatorWidth,
+            height: indicatorHeight
+        ))
+        indicator.isHidden = true
+        content.addSubview(indicator)
+        self.ampIndicator = indicator
+
         w.contentView = content
         window = w
+    }
+
+    private func configureLayout(ampMode: Bool) {
+        guard let w = window, let content = w.contentView, let label = label else { return }
+        let size = ampMode ? NSSize(width: 210, height: 240) : NSSize(width: 260, height: 80)
+        if w.frame.size != size {
+            let screen = NSScreen.main?.visibleFrame ?? NSScreen.screens[0].visibleFrame
+            w.setFrame(NSRect(x: screen.midX - size.width / 2,
+                              y: screen.minY + (ampMode ? 10 : 100),
+                              width: size.width, height: size.height), display: true)
+        }
+        content.frame = NSRect(origin: .zero, size: size)
+        content.layer?.backgroundColor = ampMode
+            ? NSColor.clear.cgColor
+            : NSColor(white: 0.1, alpha: 0.85).cgColor
+        content.layer?.cornerRadius = ampMode ? 0 : 14
+        if ampMode {
+            ampKnob?.frame = NSRect(x: 0, y: 30, width: 210, height: 210)
+        } else {
+            label.frame = NSRect(x: 20, y: 40, width: 220, height: 24)
+            label.alignment = .left
+            track?.frame = NSRect(x: 20, y: 20, width: 220, height: 8)
+        }
     }
 }
 
@@ -670,57 +933,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { UserDefaults.standard.set(newValue, forKey: "selectedUUID") }
     }
     var stepSize: Int {
-        get { max(1, UserDefaults.standard.integer(forKey: "stepSize")) }
+        get {
+            guard UserDefaults.standard.object(forKey: "stepSize") != nil else { return 3 }
+            return max(1, UserDefaults.standard.integer(forKey: "stepSize"))
+        }
         set { UserDefaults.standard.set(newValue, forKey: "stepSize") }
     }
+    private var ampMode: Bool { stepSize == 11 }
     var paused = false
     private var memberRows: [MemberVolumeRow] = []
     private var groupRows: [GroupCheckboxRow] = []
     private var targetRows: [TargetVolumeRow] = []
     private var lgRetryPending = false
     private var refreshWorkItem: DispatchWorkItem?
+    private var accessibilityTrusted = false
+    // Rotary encoders emit a stream of ordinary media-key presses. Preserve
+    // single-notch precision, but accelerate sustained turns so a fast spin
+    // can cross the volume range without dozens of identical steps.
+    private var lastVolumeTick = ProcessInfo.processInfo.systemUptime
+    private var lastVolumeDirection = 0
+    private var volumeTickStreak = 0
 
-    func applicationDidFinishLaunching(_ n: Notification) {
+    func applicationWillFinishLaunching(_ n: Notification) {
         let logPath = "/tmp/volumekey.log"
         freopen(logPath, "a", stderr)
         NSLog("=== VolumeKey launched ===")
         migrateFromSonosKey()
-        if stepSize == 0 { stepSize = 3 }
-        ensureAccessibility()
-
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = statusItem.button {
-            if let img = NSImage(systemSymbolName: "speaker.wave.3.fill", accessibilityDescription: "VolumeKey") {
-                img.isTemplate = true
-                button.image = img
-            } else {
-                button.title = "S"
-            }
-        }
-        rebuildMenu()
-        // When user opens the menu, also re-trigger network probe (in case Local Network just got granted)
-        statusItem.menu?.delegate = self
-
-        discovery.onFound = { [weak self] dev in
-            guard let self = self else { return }
-            if !self.devices.contains(where: { $0.uuid == dev.uuid }) {
-                self.devices.append(dev)
-                if self.selectedUUID == nil { self.selectedUUID = dev.uuid }
-                self.rebuildMenu()
-            }
-        }
-        discovery.start()
-        startLGDiscovery()
-        // DLNA after LG so webOS TVs are known and excluded from the renderer list.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.5) { [weak self] in
-            self?.startDLNADiscovery()
-        }
-        startRokuDiscovery()
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let displays = DDCDiscovery.scan()   // blocking I2C probes — off-main
-            DispatchQueue.main.async { displays.forEach { self?.addTarget($0) } }
-        }
-
         hijacker.onVolumeUp = { [weak self] in self?.bump(+1) }
         hijacker.onVolumeDown = { [weak self] in self?.bump(-1) }
         hijacker.onMute = { [weak self] in self?.toggleMute() }
@@ -734,7 +972,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return true
         }
-        hijacker.start()
+        // One silent trust check and at most one tap attempt per process. Never
+        // trigger a privacy prompt or retry against TCC/System Settings.
+        accessibilityTrusted = checkAccessibility()
+        if accessibilityTrusted {
+            hijacker.start()
+            accessibilityTrusted = hijacker.isActive
+        }
+        if !accessibilityTrusted {
+            NSLog("VolumeKey: Accessibility unavailable; key capture disabled for this launch")
+        }
+    }
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = statusItem.button {
+            if let img = NSImage(systemSymbolName: "speaker.wave.3.fill", accessibilityDescription: "VolumeKey") {
+                img.isTemplate = true
+                button.image = img
+            } else {
+                button.title = "S"
+            }
+        }
+        restorePersistedTarget()
+        rebuildMenu()
+        // When user opens the menu, also re-trigger network probe (in case Local Network just got granted)
+        statusItem.menu?.delegate = self
+
+        discovery.onFound = { [weak self] dev in
+            guard let self = self else { return }
+            if !self.devices.contains(where: { $0.uuid == dev.uuid }) {
+                self.devices.append(dev)
+                if self.selectedUUID == nil { self.selectedUUID = dev.uuid }
+                self.rebuildMenu()
+            }
+        }
+        startLGDiscovery()
+        startDLNADiscovery()
+        startRokuDiscovery()
+        discovery.start()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let displays = DDCDiscovery.scan()   // blocking I2C probes — off-main
+            DispatchQueue.main.async { displays.forEach { self?.addTarget($0) } }
+        }
 
         audioMonitor.onChange = { [weak self] in
             guard let self = self, let target = self.selectedNetTarget, self.followAudioOutput else { return }
@@ -767,10 +1047,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSLog("VolumeKey: migrated \(old.count) settings from SonosKey")
     }
 
-    func ensureAccessibility() {
-        // Check trusted state silently — do NOT prompt on every launch.
+    func checkAccessibility() -> Bool {
+        // One silent check per launch; never prompt, retry, deep-link, or drive
+        // System Settings.
         let opts: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
-        _ = AXIsProcessTrustedWithOptions(opts)
+        return AXIsProcessTrustedWithOptions(opts)
     }
 
     var selectedDevice: SonosDevice? {
@@ -788,12 +1069,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Network / display targets (LG webOS, DLNA, Roku, DDC)
 
     func addTarget(_ t: VolumeTarget) {
-        guard !netTargets.contains(where: { $0.uuid == t.uuid }) else { return }
-        // One backend per box: skip if another backend already owns this IP.
-        if !t.ip.isEmpty, netTargets.contains(where: { $0.ip == t.ip }) { return }
+        if netTargets.contains(where: { $0.uuid == t.uuid }) { return }
+        // One backend per box. Prefer LG webOS over DLNA when both see the same IP.
+        if !t.ip.isEmpty, let idx = netTargets.firstIndex(where: { $0.ip == t.ip }) {
+            if t is LGTVConnection, !(netTargets[idx] is LGTVConnection) {
+                let wasSelected = netTargets[idx].uuid == selectedUUID
+                netTargets[idx] = t
+                if wasSelected { selectedUUID = t.uuid }
+                persistSelectedTarget(t)
+                rebuildMenu()
+            }
+            return
+        }
         netTargets.append(t)
         if selectedUUID == nil { selectedUUID = t.uuid }
+        if t.uuid == selectedUUID { persistSelectedTarget(t) }
         rebuildMenu()
+    }
+
+    private func persistSelectedTarget(_ t: VolumeTarget?) {
+        let d = UserDefaults.standard
+        guard let t = t, !t.ip.isEmpty else {
+            d.removeObject(forKey: "selectedBackend")
+            d.removeObject(forKey: "selectedIP")
+            d.removeObject(forKey: "selectedPort")
+            d.removeObject(forKey: "selectedPath")
+            d.removeObject(forKey: "selectedName")
+            return
+        }
+        if let dlna = t as? DLNARenderer {
+            d.set("dlna", forKey: "selectedBackend")
+            d.set(Int(dlna.port), forKey: "selectedPort")
+            d.set(dlna.controlPath, forKey: "selectedPath")
+        } else if t is LGTVConnection {
+            d.set("lg", forKey: "selectedBackend")
+            d.removeObject(forKey: "selectedPort")
+            d.removeObject(forKey: "selectedPath")
+        } else if t is RokuDevice {
+            d.set("roku", forKey: "selectedBackend")
+            d.removeObject(forKey: "selectedPort")
+            d.removeObject(forKey: "selectedPath")
+        } else {
+            return
+        }
+        d.set(t.ip, forKey: "selectedIP")
+        d.set(t.name, forKey: "selectedName")
+    }
+
+    /// Instant control on launch: rebuild the last network target from disk
+    /// so volume keys work before SSDP/subnet scans finish.
+    private func restorePersistedTarget() {
+        let d = UserDefaults.standard
+        guard let uuid = selectedUUID,
+              let backend = d.string(forKey: "selectedBackend"),
+              let ip = d.string(forKey: "selectedIP"),
+              let name = d.string(forKey: "selectedName") else { return }
+        switch backend {
+        case "dlna":
+            let port = UInt16(d.integer(forKey: "selectedPort"))
+            guard port > 0, let path = d.string(forKey: "selectedPath"), !path.isEmpty else { return }
+            addTarget(DLNARenderer(uuid: uuid, name: name, ip: ip, port: port,
+                                   controlPath: path, initialVolume: nil))
+        case "lg":
+            let conn = lgConnection(for: LGTVDevice(name: name, ip: ip, uuid: uuid))
+            addTarget(conn)
+            conn.connect()
+        case "roku":
+            addTarget(RokuDevice(uuid: uuid, name: name, ip: ip))
+        default:
+            return
+        }
+        NSLog("VolumeKey: restored \(backend) target \(name) @ \(ip)")
     }
 
     func startLGDiscovery(retriesLeft: Int = 6) {
@@ -845,10 +1191,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func bump(_ dir: Int) {
         guard !paused else { NSSound.beep(); return }
+        let delta = acceleratedDelta(for: dir)
         if let target = selectedNetTarget {
-            target.bump(delta: dir * stepSize) { [weak self] vol, muted in
+            if ampMode, target.supportsAbsoluteVolume {
+                let apply = { [weak self] (current: Int, muted: Bool) in
+                    guard let self = self else { return }
+                    let backend = max(0, min(100, current + delta))
+                    target.setVolume(backend)
+                    self.hud.show(volume: backend, muted: muted, label: target.kindLabel,
+                                  ampScale: true)
+                }
+                if let current = target.cachedVolume {
+                    apply(current, false)
+                } else {
+                    target.refreshVolume { current, muted in
+                        guard let current = current else { return }
+                        DispatchQueue.main.async { apply(current, muted) }
+                    }
+                }
+                return
+            }
+            target.bump(delta: delta) { [weak self] vol, muted in
                 if let v = vol {
-                    self?.hud.show(volume: v, muted: muted, label: target.kindLabel)
+                    self?.hud.show(volume: v, muted: muted, label: target.kindLabel,
+                                   ampScale: self?.ampMode ?? false)
                 } else {
                     self?.hud.showMessage("\(target.name)  \(dir > 0 ? "▲" : "▼")")
                 }
@@ -856,7 +1222,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard let dev = selectedDevice else { NSSound.beep(); return }
-        let delta = dir * stepSize
         var displayVol: Int? = nil
         for m in dev.members {
             // Use cached value if known; otherwise fall back to querying then setting.
@@ -883,7 +1248,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
-        if let v = displayVol { hud.show(volume: v) }
+        if let v = displayVol {
+            hud.show(volume: v, ampScale: ampMode)
+        }
+    }
+
+    private func acceleratedDelta(for dir: Int) -> Int {
+        let now = ProcessInfo.processInfo.systemUptime
+        let gap = now - lastVolumeTick
+
+        if dir != lastVolumeDirection || gap > 0.22 {
+            volumeTickStreak = 1
+        } else {
+            volumeTickStreak += 1
+        }
+        lastVolumeTick = now
+        lastVolumeDirection = dir
+
+        // Two precise notches, then a progressive ramp. Reversing direction or
+        // pausing for 220 ms resets immediately, so there is no coast/overshoot.
+        let multiplier: Int
+        switch volumeTickStreak {
+        case 1...2: multiplier = 1
+        case 3...6: multiplier = 2
+        default:    multiplier = 3
+        }
+        if multiplier > 1 {
+            NSLog("VolumeKey: volume acceleration \(multiplier)x (streak \(volumeTickStreak))")
+        }
+        // Amp mode accelerates in backend positions (1/100 of the full range),
+        // never in its visual 0...11 labels.
+        return dir * (ampMode ? 1 : stepSize) * multiplier
     }
 
     func toggleMute() {
@@ -891,7 +1286,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let target = selectedNetTarget {
             target.toggleMute { [weak self] vol, muted in
                 if let v = vol {
-                    self?.hud.show(volume: v, muted: muted, label: target.kindLabel)
+                    self?.hud.show(volume: v, muted: muted, label: target.kindLabel,
+                                   ampScale: self?.ampMode ?? false)
                 } else {
                     self?.hud.showMessage("\(target.name)  mute")
                 }
@@ -903,7 +1299,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.controller.setMute(device: dev, muted: !muted) {
                 self?.controller.getVolume(device: dev) { vol in
                     DispatchQueue.main.async {
-                        self?.hud.show(volume: vol ?? 0, muted: !muted)
+                        self?.hud.show(volume: vol ?? 0, muted: !muted,
+                                       ampScale: self?.ampMode ?? false)
                         self?.refreshAllRowsSoon()
                     }
                 }
@@ -931,6 +1328,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Reuse the SAME NSMenu instance so modifications appear live in the currently-open menu.
         let menu = statusItem.menu ?? NSMenu()
         menu.removeAllItems()
+        if !accessibilityTrusted {
+            menu.addItem(NSMenuItem(
+                title: "Accessibility unavailable — enable, then relaunch",
+                action: nil,
+                keyEquivalent: ""))
+            menu.addItem(.separator())
+        }
         if devices.isEmpty && netTargets.isEmpty {
             menu.addItem(NSMenuItem(title: "Searching for Sonos & LG TVs…", action: nil, keyEquivalent: ""))
         } else {
@@ -1089,7 +1493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         let stepMenu = NSMenu()
-        for s in [1, 2, 3, 5, 10] {
+        for s in [1, 2, 3, 5, 10, 11] {
             let it = NSMenuItem(title: "\(s)", action: #selector(setStep(_:)), keyEquivalent: "")
             it.target = self
             it.representedObject = s
@@ -1131,6 +1535,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func selectDevice(_ sender: NSMenuItem) {
         selectedUUID = sender.representedObject as? String
+        persistSelectedTarget(selectedNetTarget)
         // Selecting a TV connects right away (triggers the one-time pairing prompt if new).
         if let lg = selectedNetTarget as? LGTVConnection { lg.connect() }
         rebuildMenu()
@@ -1166,9 +1571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func silentRefresh(retriesLeft: Int = 0, expectChange: Bool = false) {
         startLGDiscovery()  // net targets too — updates IPs in place, appends new sets
         startRokuDiscovery()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
-            self?.startDLNADiscovery()
-        }
+        startDLNADiscovery()
         let probe = SonosDiscovery()
         var collected: [SonosDevice] = []
         probe.onFound = { dev in
@@ -1630,5 +2033,7 @@ final class MixerSliderRow: NSView {
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.regular)
+// Menu-bar agent: remain absent from both the Dock and Command-Tab even if
+// Launch Services has cached older bundle metadata.
+app.setActivationPolicy(.accessory)
 app.run()
