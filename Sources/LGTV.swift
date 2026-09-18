@@ -80,6 +80,16 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
     private(set) var state: State = .disconnected
     private(set) var cachedVolume: Int?
     private(set) var cachedMuted = false
+    private(set) var soundOutputRaw: String?
+
+    /// True when the TV routes audio to an external device (eARC soundbar,
+    /// optical, BT). In that mode webOS accepts `setVolume` (returnValue:true)
+    /// but silently drops it — only volumeUp/volumeDown step commands are
+    /// forwarded (as CEC) to the external device.
+    var isExternalOutput: Bool {
+        guard let so = soundOutputRaw else { return false }
+        return !(so.contains("tv_speaker") || so.contains("headphone"))
+    }
 
     /// Called on pairing prompt / connection failures — text for the HUD.
     var onUserMessage: ((String) -> Void)?
@@ -92,6 +102,7 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
     private var completions: [String: ([String: Any]?) -> Void] = [:]
     private var pendingActions: [() -> Void] = []
     private var triedPlaintextFallback = false
+    private var triedMinimalManifest = false
 
     private var clientKeyDefaultsKey: String { "lgtv.clientKey.\(device.uuid)" }
     private var clientKey: String? {
@@ -119,6 +130,7 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
         guard state == .disconnected else { return }
         state = .connecting
         triedPlaintextFallback = false
+        triedMinimalManifest = false
         open(url: URL(string: "wss://\(device.ip):3001")!)
     }
 
@@ -158,8 +170,9 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
     }
 
     private func register() {
+        let manifest = triedMinimalManifest ? lgMinimalManifestJSON : lgPairingManifestJSON
         guard var payload = try? JSONSerialization.jsonObject(
-            with: Data(lgPairingManifestJSON.utf8)) as? [String: Any] else { return }
+            with: Data(manifest.utf8)) as? [String: Any] else { return }
         if let key = clientKey { payload["client-key"] = key }
         send(type: "register", id: "register_0", uri: nil, payload: payload)
     }
@@ -219,6 +232,14 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
                 // Stored key was revoked (e.g. TV reset) — re-pair from scratch.
                 clientKey = nil
                 register()
+            } else if !triedMinimalManifest {
+                // Firmware rejected the manifest itself (LG blacklisted the old
+                // signed one in 2025; a future update could reject others) —
+                // retry once with the smallest possible permission set before
+                // giving up.
+                triedMinimalManifest = true
+                NSLog("VolumeKey: LGTV retrying registration with minimal manifest")
+                register()
             } else {
                 onUserMessage?("\(device.name) rejected pairing")
                 disconnect()
@@ -272,9 +293,12 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
         if let vs = payload["volumeStatus"] as? [String: Any] {
             vol = vs["volume"] as? Int
             mute = (vs["muteStatus"] as? Bool) ?? (vs["mute"] as? Bool)
+            if let so = vs["soundOutput"] as? String { soundOutputRaw = so }
         } else {
             vol = payload["volume"] as? Int
             mute = (payload["mute"] as? Bool) ?? (payload["muted"] as? Bool)
+            // Old webOS reports e.g. "mastervolume_ext_speaker_arc" here.
+            if let sc = payload["scenario"] as? String { soundOutputRaw = sc }
         }
         if let v = vol { cachedVolume = v }
         if let m = mute { cachedMuted = m }
@@ -294,9 +318,27 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
 
     // MARK: Public audio API
 
+    /// Sends |delta| discrete volume presses — the only form the TV forwards
+    /// to an external (eARC/optical/BT) audio device.
+    private func step(by delta: Int) {
+        let uri = delta >= 0 ? "ssap://audio/volumeUp" : "ssap://audio/volumeDown"
+        for _ in 0..<min(abs(delta), 15) { request(uri) }
+    }
+
     func bump(delta: Int, completion: @escaping (Int?, Bool) -> Void) {
         whenReady { [weak self] in
             guard let self = self else { return }
+            if self.isExternalOutput {
+                self.step(by: delta)
+                if let cur = self.cachedVolume {
+                    let target = max(0, min(100, cur + delta))
+                    self.cachedVolume = target
+                    completion(target, self.cachedMuted)
+                } else {
+                    completion(nil, self.cachedMuted)
+                }
+                return
+            }
             if let cur = self.cachedVolume {
                 let target = max(0, min(100, cur + delta))
                 self.cachedVolume = target
@@ -318,6 +360,11 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
         whenReady { [weak self] in
             guard let self = self else { return }
             let v = max(0, min(100, volume))
+            if self.isExternalOutput {
+                if let cur = self.cachedVolume, cur != v { self.step(by: v - cur) }
+                self.cachedVolume = v
+                return
+            }
             self.cachedVolume = v
             self.request("ssap://audio/setVolume", payload: ["volume": v])
         }
@@ -363,11 +410,14 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
     }
 }
 
-// MARK: - Standard webOS pairing manifest
+// MARK: - webOS pairing manifest (unsigned)
 //
-// This is the well-known registration manifest (appId com.lge.test) that LG's
-// firmware accepts from local remote-control apps; the signature blob is LG's
-// own test-signing certificate, required verbatim for the CONTROL_AUDIO grant.
+// Historically third-party apps registered with LG's leaked test-signing
+// manifest (appId com.lge.test). 2025 firmware blacklists that certificate
+// ("403 Pairing rejected: blacklisted certificate detected"), so we register
+// with a plain unsigned manifest instead. The pairing prompt still appears and
+// grants every permission below; only TEST_SECURE-class permissions (unused
+// here) required the signed blob.
 
 let lgPairingManifestJSON = """
 {
@@ -376,42 +426,25 @@ let lgPairingManifestJSON = """
   "manifest": {
     "manifestVersion": 1,
     "appVersion": "1.1",
-    "signed": {
-      "created": "20140509",
-      "appId": "com.lge.test",
-      "vendorId": "com.lge",
-      "localizedAppNames": {
-        "": "LG Remote App",
-        "ko-KR": "리모컨 앱",
-        "zxx-XX": "ЛГ Rэмotэ AПП"
-      },
-      "localizedVendorNames": {
-        "": "LG Electronics"
-      },
-      "permissions": [
-        "TEST_SECURE", "CONTROL_INPUT_TEXT", "CONTROL_MOUSE_AND_KEYBOARD",
-        "READ_INSTALLED_APPS", "READ_LGE_SDX", "READ_NOTIFICATIONS", "SEARCH",
-        "WRITE_SETTINGS", "WRITE_NOTIFICATION_ALERT", "CONTROL_POWER",
-        "READ_CURRENT_CHANNEL", "READ_RUNNING_APPS", "READ_UPDATE_INFO",
-        "UPDATE_FROM_REMOTE_APP", "READ_LGE_TV_INPUT_EVENTS", "READ_TV_CURRENT_TIME"
-      ],
-      "serial": "2f930e2d2cfe083771f68e4fe7bb07"
-    },
     "permissions": [
-      "LAUNCH", "LAUNCH_WEBAPP", "APP_TO_APP", "CLOSE", "TEST_OPEN",
-      "TEST_PROTECTED", "CONTROL_AUDIO", "CONTROL_DISPLAY",
-      "CONTROL_INPUT_JOYSTICK", "CONTROL_INPUT_MEDIA_RECORDING",
-      "CONTROL_INPUT_MEDIA_PLAYBACK", "CONTROL_INPUT_TV", "CONTROL_POWER",
-      "READ_APP_STATUS", "READ_CURRENT_CHANNEL", "READ_INPUT_DEVICE_LIST",
-      "READ_NETWORK_STATE", "READ_RUNNING_APPS", "READ_TV_CHANNEL_LIST",
-      "WRITE_NOTIFICATION_TOAST", "READ_POWER_STATE", "READ_COUNTRY_INFO"
-    ],
-    "signatures": [
-      {
-        "signatureVersion": 1,
-        "signature": "eyJhbGdvcml0aG0iOiJSU0EtU0hBMjU2Iiwia2V5SWQiOiJ0ZXN0LXNpZ25pbmctY2VydCIsInNpZ25hdHVyZVZlcnNpb24iOjF9.hrVRgjCwXVvE2OOSpDZ58hR+59aFNwYDyjQgKk3auukd7pcegmE2CzPCa0bJ0ZsRAcKkCTJrWo5iDzNhMBWRyaMOv5zWSrthlf7G128qvIlpMT0YNY+n/FaOHE73uLrS/g7swl3/qH/BGFG2Hu4RlL48eb3lLKqTt2xKHdCs6Cd4RMfJPYnzgvI4BNrFUKsjkcu+WD4OO2A27Pq1n50cMchmcaXadJhGrOqH5YmHdOCj5NSHzJYrsW0HPlpuAx/ECMeIZYDh6RMqaFM2DXzdKX9NmmyqzJ3o/0lkk/N97gfVRLW5hA29yeAwaCViZNCP8iC9aO0q9fQojoa7NQnAtw=="
-      }
+      "CONTROL_AUDIO", "READ_APP_STATUS", "READ_CURRENT_CHANNEL",
+      "READ_RUNNING_APPS", "READ_POWER_STATE", "READ_NETWORK_STATE",
+      "READ_COUNTRY_INFO", "WRITE_NOTIFICATION_TOAST"
     ]
+  }
+}
+"""
+
+// Last-resort registration payload: audio control only. Used automatically if
+// the TV rejects the manifest above, so one bad permission can never brick
+// pairing outright.
+let lgMinimalManifestJSON = """
+{
+  "forcePairing": false,
+  "pairingType": "PROMPT",
+  "manifest": {
+    "manifestVersion": 1,
+    "permissions": ["CONTROL_AUDIO", "READ_APP_STATUS"]
   }
 }
 """

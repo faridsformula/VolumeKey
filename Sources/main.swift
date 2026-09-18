@@ -405,6 +405,23 @@ final class SonosController {
         }
     }
 
+    /// True when the zone's coordinator is actively rendering its TV input
+    /// (the x-sonos-htastream eARC/optical stream). Idle home-theater zones
+    /// keep the htastream URI set permanently, so PLAYING state is required
+    /// too — otherwise every Beam/Arc in the house would match.
+    func isRenderingTVStream(device: SonosDevice, completion: @escaping (Bool) -> Void) {
+        avTransport(ip: device.ip, action: "GetMediaInfo", args: ["InstanceID": "0"]) { [weak self] xml in
+            guard let self = self, xml?.contains("x-sonos-htastream") == true else {
+                completion(false); return
+            }
+            self.avTransport(ip: device.ip, action: "GetTransportInfo", args: ["InstanceID": "0"]) { xml2 in
+                guard let xml2 = xml2, let r = xml2.range(of: "<CurrentTransportState>"),
+                      let e = xml2.range(of: "</CurrentTransportState>") else { completion(false); return }
+                completion(xml2[r.upperBound..<e.lowerBound] == "PLAYING")
+            }
+        }
+    }
+
     // Make `joiningCoordinatorIP` (and its bonded members) join the group whose coordinator is `targetUUID`.
     func joinGroup(joiningCoordinatorIP: String, targetCoordinatorUUID: String, completion: @escaping () -> Void) {
         avTransport(ip: joiningCoordinatorIP, action: "SetAVTransportURI",
@@ -653,6 +670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let hud = VolumeHUD()
     let audioMonitor = AudioOutputMonitor()
     let micMute = MicMuteController()
+    let updateCheck = UpdateCheck()
 
     // Auto-switch: when the default output has native volume (AirPods, BT
     // headphones, speakers), volume keys stay with macOS; when it doesn't
@@ -665,6 +683,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var devices: [SonosDevice] = []
     var netTargets: [VolumeTarget] = []          // LG webOS, DLNA, Roku, DDC displays
     var lgConnections: [String: LGTVConnection] = [:]
+    // TV uuid → Sonos zone uuid that renders this TV's eARC/optical audio.
+    // Identified at runtime so keys can drive the real device directly.
+    private var htPartner: [String: String] = [:]
+    private var htProbeInFlight = Set<String>()
     var selectedUUID: String? {
         get { UserDefaults.standard.string(forKey: "selectedUUID") }
         set { UserDefaults.standard.set(newValue, forKey: "selectedUUID") }
@@ -743,6 +765,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         audioMonitor.start()
         micMute.start()
+
+        updateCheck.onUpdateFound = { [weak self] version in
+            self?.hud.showMessage("VolumeKey \(version) is available — download from the menu")
+            self?.rebuildMenu()
+        }
+        updateCheck.start()
     }
 
     func toggleMicMute() {
@@ -824,6 +852,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let c = lgConnections[dev.uuid] { return c }
         let c = LGTVConnection(device: dev)
         c.onUserMessage = { [weak self] text in self?.hud.showMessage(text) }
+        c.onAudioStatus = { [weak self] _, _ in
+            guard let self = self, c.isExternalOutput else { return }
+            self.probeHTPartner(for: c)
+        }
         lgConnections[dev.uuid] = c
         return c
     }
@@ -843,9 +875,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         probe.start()
     }
 
+    /// The Sonos zone this TV's external audio lands on, if identified.
+    func htPartnerZone(for tv: LGTVConnection) -> SonosDevice? {
+        guard let zoneUUID = htPartner[tv.uuid] else { return nil }
+        return devices.first(where: { $0.uuid == zoneUUID })
+    }
+
+    /// Find the Sonos zone actively rendering a TV stream. Only an unambiguous
+    /// single match is trusted — with two rooms playing TV audio at once we
+    /// can't tell which zone belongs to this TV, so TV steps stay in charge.
+    func probeHTPartner(for tv: LGTVConnection) {
+        guard htPartner[tv.uuid] == nil, !htProbeInFlight.contains(tv.uuid), !devices.isEmpty else { return }
+        htProbeInFlight.insert(tv.uuid)
+        var matches: [SonosDevice] = []
+        let group = DispatchGroup()
+        for zone in devices {
+            group.enter()
+            controller.isRenderingTVStream(device: zone) { rendering in
+                DispatchQueue.main.async {
+                    if rendering { matches.append(zone) }
+                    group.leave()
+                }
+            }
+        }
+        group.notify(queue: .main) { [weak self] in
+            guard let self = self else { return }
+            self.htProbeInFlight.remove(tv.uuid)
+            guard matches.count == 1, let zone = matches.first else {
+                NSLog("VolumeKey: eARC partner probe for \(tv.name): \(matches.count) zones rendering TV audio — keeping TV steps")
+                return
+            }
+            self.htPartner[tv.uuid] = zone.uuid
+            NSLog("VolumeKey: \(tv.name) audio renders on Sonos '\(zone.name)' — keys now control it directly")
+            // Warm the member volume cache so the first redirected press is instant.
+            for m in zone.members { self.controller.getMemberVolume(member: m) { _ in } }
+        }
+    }
+
     func bump(_ dir: Int) {
         guard !paused else { NSSound.beep(); return }
         if let target = selectedNetTarget {
+            // eARC/optical: the TV never renders audio itself and its volume
+            // number is a phantom counter. Once the Sonos zone the audio
+            // actually lands on is known, drive it directly so the HUD shows
+            // the real volume on the real scale.
+            if let lg = target as? LGTVConnection, lg.isExternalOutput {
+                if let zone = htPartnerZone(for: lg) {
+                    bumpZone(zone, delta: dir * stepSize, label: zone.name)
+                    return
+                }
+                probeHTPartner(for: lg)  // identify for upcoming presses; TV steps meanwhile
+            }
             target.bump(delta: dir * stepSize) { [weak self] vol, muted in
                 if let v = vol {
                     self?.hud.show(volume: v, muted: muted, label: target.kindLabel)
@@ -856,7 +936,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard let dev = selectedDevice else { NSSound.beep(); return }
-        let delta = dir * stepSize
+        bumpZone(dev, delta: dir * stepSize)
+    }
+
+    private func bumpZone(_ dev: SonosDevice, delta: Int, label: String = "Sonos") {
         var displayVol: Int? = nil
         for m in dev.members {
             // Use cached value if known; otherwise fall back to querying then setting.
@@ -883,12 +966,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
-        if let v = displayVol { hud.show(volume: v) }
+        if let v = displayVol { hud.show(volume: v, label: label) }
     }
 
     func toggleMute() {
         guard !paused else { return }
         if let target = selectedNetTarget {
+            if let lg = target as? LGTVConnection, lg.isExternalOutput,
+               let zone = htPartnerZone(for: lg) {
+                muteZone(zone, label: zone.name)
+                return
+            }
             target.toggleMute { [weak self] vol, muted in
                 if let v = vol {
                     self?.hud.show(volume: v, muted: muted, label: target.kindLabel)
@@ -899,11 +987,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard let dev = selectedDevice else { return }
+        muteZone(dev)
+    }
+
+    private func muteZone(_ dev: SonosDevice, label: String = "Sonos") {
         controller.getMute(device: dev) { [weak self] muted in
             self?.controller.setMute(device: dev, muted: !muted) {
                 self?.controller.getVolume(device: dev) { vol in
                     DispatchQueue.main.async {
-                        self?.hud.show(volume: vol ?? 0, muted: !muted)
+                        self?.hud.show(volume: vol ?? 0, muted: !muted, label: label)
                         self?.refreshAllRowsSoon()
                     }
                 }
@@ -1124,9 +1216,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(rescan)
 
         menu.addItem(.separator())
+        if let v = updateCheck.availableVersion {
+            let update = NSMenuItem(title: "Download VolumeKey \(v)…",
+                                    action: #selector(openReleasesPage), keyEquivalent: "")
+            update.target = self
+            menu.addItem(update)
+        }
         let quit = NSMenuItem(title: "Quit VolumeKey", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
         statusItem.menu = menu
+    }
+
+    @objc func openReleasesPage() {
+        NSWorkspace.shared.open(UpdateCheck.releasesPage)
     }
 
     @objc func selectDevice(_ sender: NSMenuItem) {
