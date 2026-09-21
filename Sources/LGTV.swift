@@ -103,6 +103,7 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
     private var pendingActions: [() -> Void] = []
     private var triedPlaintextFallback = false
     private var triedMinimalManifest = false
+    private var triedWithoutClientKey = false
 
     private var clientKeyDefaultsKey: String { "lgtv.clientKey.\(device.uuid)" }
     private var clientKey: String? {
@@ -131,6 +132,7 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
         state = .connecting
         triedPlaintextFallback = false
         triedMinimalManifest = false
+        triedWithoutClientKey = false
         open(url: URL(string: "wss://\(device.ip):3001")!)
     }
 
@@ -228,17 +230,20 @@ final class LGTVConnection: NSObject, URLSessionWebSocketDelegate, VolumeTarget 
         case ("error", "register_0"):
             let errText = (msg["error"] as? String) ?? "unknown"
             NSLog("VolumeKey: LGTV register error: \(errText)")
-            if clientKey != nil {
-                // Stored key was revoked (e.g. TV reset) — re-pair from scratch.
-                clientKey = nil
-                register()
-            } else if !triedMinimalManifest {
-                // Firmware rejected the manifest itself (LG blacklisted the old
-                // signed one in 2025; a future update could reject others) —
-                // retry once with the smallest possible permission set before
-                // giving up.
+            if !triedMinimalManifest {
+                // Manifest-level rejections (LG blacklisted its leaked signing
+                // cert in 2025; a future update could reject others) happen
+                // BEFORE the TV looks at the client-key — so retry with the
+                // smallest possible manifest and KEEP the stored key. Clearing
+                // it here would destroy a valid pairing and force a re-prompt.
                 triedMinimalManifest = true
                 NSLog("VolumeKey: LGTV retrying registration with minimal manifest")
+                register()
+            } else if clientKey != nil, !triedWithoutClientKey {
+                // Both manifests rejected with a key attached — the key itself
+                // was revoked (e.g. TV reset). Re-pair from scratch, once.
+                triedWithoutClientKey = true
+                clientKey = nil
                 register()
             } else {
                 onUserMessage?("\(device.name) rejected pairing")
