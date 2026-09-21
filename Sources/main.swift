@@ -684,8 +684,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var netTargets: [VolumeTarget] = []          // LG webOS, DLNA, Roku, DDC displays
     var lgConnections: [String: LGTVConnection] = [:]
     // TV uuid → Sonos zone uuid that renders this TV's eARC/optical audio.
-    // Identified at runtime so keys can drive the real device directly.
-    private var htPartner: [String: String] = [:]
+    // A probe only NOMINATES a candidate (the one zone playing a TV stream can
+    // belong to a DIFFERENT TV — seen with two LG TVs + two Sonos HT zones);
+    // the candidate is promoted to partner only after a key press through the
+    // TV demonstrably moves that zone's volume.
+    private var htPartner: [String: String] = [:]        // confirmed
+    private var htCandidate: [String: String] = [:]      // awaiting confirmation
+    private var htRejected: [String: Set<String>] = [:]  // zones proven not ours, per TV
+    private var htValidationInFlight = Set<String>()
+    private var htValidationFails: [String: Int] = [:]
     private var htProbeInFlight = Set<String>()
     var selectedUUID: String? {
         get { UserDefaults.standard.string(forKey: "selectedUUID") }
@@ -881,15 +888,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return devices.first(where: { $0.uuid == zoneUUID })
     }
 
-    /// Find the Sonos zone actively rendering a TV stream. Only an unambiguous
-    /// single match is trusted — with two rooms playing TV audio at once we
-    /// can't tell which zone belongs to this TV, so TV steps stay in charge.
+    /// Find the Sonos zone actively rendering a TV stream and nominate it as a
+    /// CANDIDATE. Only an unambiguous single match is nominated, and it still
+    /// has to pass validateHTCandidate before keys control it directly.
     func probeHTPartner(for tv: LGTVConnection) {
-        guard htPartner[tv.uuid] == nil, !htProbeInFlight.contains(tv.uuid), !devices.isEmpty else { return }
+        guard htPartner[tv.uuid] == nil, htCandidate[tv.uuid] == nil,
+              !htProbeInFlight.contains(tv.uuid), !devices.isEmpty else { return }
         htProbeInFlight.insert(tv.uuid)
+        let rejected = htRejected[tv.uuid] ?? []
         var matches: [SonosDevice] = []
         let group = DispatchGroup()
-        for zone in devices {
+        for zone in devices where !rejected.contains(zone.uuid) {
             group.enter()
             controller.isRenderingTVStream(device: zone) { rendering in
                 DispatchQueue.main.async {
@@ -905,10 +914,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSLog("VolumeKey: eARC partner probe for \(tv.name): \(matches.count) zones rendering TV audio — keeping TV steps")
                 return
             }
-            self.htPartner[tv.uuid] = zone.uuid
-            NSLog("VolumeKey: \(tv.name) audio renders on Sonos '\(zone.name)' — keys now control it directly")
-            // Warm the member volume cache so the first redirected press is instant.
-            for m in zone.members { self.controller.getMemberVolume(member: m) { _ in } }
+            self.htCandidate[tv.uuid] = zone.uuid
+            self.htValidationFails[tv.uuid] = 0
+            NSLog("VolumeKey: \(tv.name) partner candidate: Sonos '\(zone.name)' — confirming on the next key press")
+        }
+    }
+
+    /// A key press just went through the TV — check whether the candidate
+    /// zone's volume actually moved. Promote it on movement; after two presses
+    /// with no movement it belongs to another TV, so reject it for this one.
+    private func validateHTCandidate(for tv: LGTVConnection) {
+        guard let zoneUUID = htCandidate[tv.uuid],
+              let zone = devices.first(where: { $0.uuid == zoneUUID }),
+              !htValidationInFlight.contains(tv.uuid) else { return }
+        htValidationInFlight.insert(tv.uuid)
+        controller.getVolume(device: zone) { [weak self] before in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                self?.controller.getVolume(device: zone) { after in
+                    DispatchQueue.main.async {
+                        guard let self = self else { return }
+                        self.htValidationInFlight.remove(tv.uuid)
+                        guard let b = before, let a = after else { return }  // unreadable — retry next press
+                        if a != b {
+                            self.htCandidate[tv.uuid] = nil
+                            self.htPartner[tv.uuid] = zone.uuid
+                            NSLog("VolumeKey: confirmed — \(tv.name) audio renders on Sonos '\(zone.name)'; keys now control it directly")
+                            for m in zone.members { self.controller.getMemberVolume(member: m) { _ in } }
+                        } else {
+                            let fails = (self.htValidationFails[tv.uuid] ?? 0) + 1
+                            self.htValidationFails[tv.uuid] = fails
+                            if fails >= 2 {
+                                self.htCandidate[tv.uuid] = nil
+                                self.htRejected[tv.uuid, default: []].insert(zone.uuid)
+                                NSLog("VolumeKey: Sonos '\(zone.name)' did not react to \(tv.name)'s volume steps — rejected (it belongs to another TV); keeping TV steps")
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -924,7 +967,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     bumpZone(zone, delta: dir * stepSize, label: zone.name)
                     return
                 }
-                probeHTPartner(for: lg)  // identify for upcoming presses; TV steps meanwhile
+                if htCandidate[lg.uuid] != nil {
+                    // This press goes through the TV — use it to test whether
+                    // the candidate zone is really the one moving.
+                    validateHTCandidate(for: lg)
+                } else {
+                    probeHTPartner(for: lg)  // nominate for upcoming presses; TV steps meanwhile
+                }
             }
             target.bump(delta: dir * stepSize) { [weak self] vol, muted in
                 if let v = vol {
