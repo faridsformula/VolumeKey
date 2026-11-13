@@ -21,7 +21,7 @@
 	<key>LSMinimumSystemVersion</key>
 	<string>12.0</string>
 	<key>LSUIElement</key>
-	<false/>
+	<true/>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_sonos._tcp</string>
