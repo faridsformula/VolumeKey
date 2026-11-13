@@ -680,6 +680,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { UserDefaults.standard.set(newValue, forKey: "followAudioOutput") }
     }
 
+    var showInDock: Bool {
+        UserDefaults.standard.object(forKey: "showInDock") as? Bool ?? true
+    }
+
     var devices: [SonosDevice] = []
     var netTargets: [VolumeTarget] = []          // LG webOS, DLNA, Roku, DDC displays
     var lgConnections: [String: LGTVConnection] = [:]
@@ -1255,6 +1259,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         followItem.toolTip = "When the Mac's audio output is a device with its own volume (AirPods, Bluetooth headphones, speakers), volume keys control it. When output is the TV over HDMI, keys control the TV."
         menu.addItem(followItem)
 
+        let dockItem = NSMenuItem(title: "Show in Dock", action: #selector(toggleShowInDock), keyEquivalent: "")
+        dockItem.target = self
+        dockItem.state = showInDock ? .on : .off
+        menu.addItem(dockItem)
+
         let pauseItem = NSMenuItem(title: paused ? "Resume key hijack" : "Pause key hijack",
                                    action: #selector(togglePause), keyEquivalent: "")
         pauseItem.target = self
@@ -1302,6 +1311,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc func toggleFollowAudio() {
         followAudioOutput.toggle()
+        rebuildMenu()
+    }
+    @objc func toggleShowInDock() {
+        let show = !showInDock
+        guard NSApp.setActivationPolicy(show ? .regular : .accessory) else { return }
+        UserDefaults.standard.set(show, forKey: "showInDock")
         rebuildMenu()
     }
     @objc func togglePause() {
@@ -1781,5 +1796,5 @@ final class MixerSliderRow: NSView {
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(delegate.showInDock ? .regular : .accessory)
 app.run()

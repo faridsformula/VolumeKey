@@ -25,6 +25,7 @@ Everything is discovered automatically on your local network. Pick a target from
 - **Mic mute: ⌥ + mute key** — mutes your microphone at the OS level (every app hears silence), works with any input device, stays muted even if your default mic changes
 - **Sonos extras** — group/ungroup rooms from the menu, per-speaker sliders (including subs and surrounds), a mixer window (⌘M)
 - **Adjustable step size** per key press
+- **Optional Dock icon** — uncheck **Show in Dock** in the menu to run from the menu bar only. The change takes effect immediately and is remembered across launches; the Dock icon is shown by default.
 
 ## Install
 
